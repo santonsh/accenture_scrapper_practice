@@ -1,9 +1,11 @@
 
 # Practice Scrapper documentation
 ## Installation
-    - virtualenv venv 
-    - venv activate
+    - git clone https://github.com/santonsh/accenture_scrapper_practice.git
+    - virtualenv env 
+    - \env\Scripts\activate.bat [windows]
     - pip install -r requirements
+    
 ## Usage
     - read the usage help page
         python app.py -h 
@@ -11,6 +13,8 @@
         python app.py OR python app.py 
     - run modest testing
         python app.py -t
+    - Advanced example: run with 8 workers, maximum 100 urls, traverce the same domain only, start with urls listed in urls.in
+        python app.py -m 100 -w 8 -l domainonly -u urls.in
 
 ## Folder organization
 output files:

@@ -1,352 +1,481 @@
-import argparse
-import urllib.request
-import threading 
-import queue
+from parsers import extract_emails, extract_urls, normalize_urls
 import time
-from url_normalize import url_normalize
-from urllib.error import URLError
+import json
+import argparse
+from multiprocessing import Lock, Queue, Process, Value, Manager
+import urllib
+import queue
 import re
+import os
+from urllib.error import URLError
+import logging
+from logging.handlers import QueueHandler, QueueListener
 from testlib import generate_test_graph
+import unittest
 
-def initial_urls(urls_file):
-    urls = []
-    urls_file = 'urls'
-    with open(urls_file, 'r') as uf:
-        for l in uf:
-            urls.append(url_normalize(l))
-    return urls
+# --------------------------------------------------------------------------
+# Auxiliary section
+# --------------------------------------------------------------------------
+def clean_log_files(files):
+        """simple function to remove old log files"""
+        for f in files:
+            try:
+                os.remove(f)
+            except:
+                pass
 
-class downloaderThread(threading.Thread):
-    def __init__(self, threadID, dq, pq, visited_urls, test_graph={}):
-        threading.Thread.__init__(self)
-        self.threadID = threadID
-        self.dq = dq
-        self.pq = pq
-        self.visited_urls = visited_urls
-        self.test_graph = test_graph
+def createQueueListener(log_queue):
+    """simple function that creates log queue handler/listener """
+    formatter = logging.Formatter('%(relativeCreated)d: %(levelname)s: %(message)s')
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+    file_handler = logging.FileHandler("scrapper.log")
+    file_handler.setFormatter(formatter)
+    listener = QueueListener(log_queue, console_handler, file_handler)
 
-    def run(self):
-        print("Starting " + str(self.threadID))
-        while not exitFlag:
-            self.dq.acquire()
-            # take a job from download queue
-            if not self.dq.empty():
-                url = self.dq.get()
-                self.dq.release()
-                self.visited_urls.acquire()
-                self.visited_urls.add(url)
-                self.visited_urls.release()
-                try:
-                    if self.test_graph == {}:
-                        real_url, page = get_html_page(url)
-                    else:
-                        # for offline test  
-                        page = self.test_graph[url].get_page()
-                        real_url = url 
-                        #print('pageis '+page)
-                except:
-                    real_url = ''
-                    page = []
-                    #print('failed to download')
-                if real_url == '':
-                    # add to visited DB
-                    #visitedURLs[url] = 'error'
-                    pass
-                else:
-                    # add url to visited DB
-                    #visitedURLs[url] = 'done'
-                    if real_url != url:
-                        #visitedURLs[real_url] = 'done'
-                        self.visited_urls.acquire()
-                        self.visited_urls.add(real_url)
-                        self.visited_urls.release()
-                    # add page to processor queue
-                    self.pq.acquire()
-                    self.pq.put(page)
-                    self.pq.release()
-            # download queue is empty. Lets wait and see if it fills up
-            else:
-                self.dq.release()
-                time.sleep(1)
+    return listener
 
-        print("Exiting " + str(self.threadID))
+def get_queue_logger(loggerQueue):
+        """this simply returns queue logger based on the provided shared queue. 
+        This is needed for multiprocessing logging. The function should be called from each worker to get
+         a multiprocessing logger"""
+        queue_handler = QueueHandler(loggerQueue)
+        logger = logging.getLogger()
+        logger.addHandler(queue_handler)
+        logger.setLevel(logging.DEBUG)
+        return logger
 
-def get_html_page(url):
-    # this function is responsible for downloading a single html page
+def append_to_file(fname, content):
+    """simple wrapper to append lines to file. Used to store scrapped items and visited urls"""
+    with open(fname, 'a+') as f:
+        for l in content:
+            f.write(l+'\n')
+
+def read_initial_urls(urls_file):
+    """simple function to return list of newline-separated initial urls written in urls_file"""
+    try:
+        with open(urls_file, 'r') as uf:
+            urls = [l for l in uf]
+        return urls
+    except:
+        return []
+
+def download_html_page(logger, url):
+    """ this function is responsible for downloading a single html page"""
     req = urllib.request.Request(url)
-    response = urllib.request.urlopen(req)
-    page = []
+    page = ''
+    real_url = ''
     try:
         response = urllib.request.urlopen(req)
     except URLError as e:
         if hasattr(e, 'reason'):
-            print('We failed to reach a server.')
-            print('Reason: ', e.reason)
+            logger.warning('The server couldn\'t fulfill the request.')
+            logger.warning('Reason: '+str(e.reason))
+            logger.debug(url)
+            pass
         elif hasattr(e, 'code'):
-            print('The server couldn\'t fulfill the request.')
-            print('Error code: ', e.code)
-        raise 
+            logger.warning('The server couldn\'t fulfill the request.')
+            logger.warning('Error code: '+str(e.code))
+            logger.debug(url)
+            pass
+        raise
     
     # download successful
     real_url = response.geturl()
     try:
-        data_type = re.findall('(.*);', response.info()['Content-Type'])[0]
+        data_type = re.findall(
+            '(text/html).*', response.info()['Content-Type'])[0]
         if data_type == 'text/html':
             page = response.read().decode('utf-8')
-            #print(page)
     except:
+        logger.warning('failed to parse a page, probably not an html document')
         raise
     return real_url, page
-    
-class processorThread(threading.Thread):
-    def __init__(self, threadID, dq, pq, parser, store_sets):
-        threading.Thread.__init__(self)
-        self.threadID = threadID
-        self.dq = dq
-        self.pq = pq
-        self.parser = parser
-        self.store_sets = store_sets
 
-    def run(self):
-        print("Starting " + str(self.threadID))
-        findings = {}
-        while not exitFlag:
-            print('p is aquiring')
-            self.pq.acquire()
-            # take a job from processing queue
-            if not self.pq.empty():
-                page = self.pq.get()
-                self.pq.release()
-                #print(self.threadID +' processing ' + 'some page')
-                #prarse the queued page
-                #print(page)
-                #self.parser.parse(page) 
-                try:
-                    findings = self.parser.parse(page)
-                    
-                except:
-                    findings = {}
-                for f in findings:
-                    print(self.threadID+' found '+ str(len(findings[f]))+' of type '+str(f))
+def download_html_page_simulated(logger, test_graph, url):
+    """this function is needed for test purpuses. It returns a test html page that 
+       is stored in a test dictionary modeling an internet document network"""
+    logger.debug('Returning test page for url: ' + url)
+    real_url = url
+    try:
+        #time.sleep(1)
+        page = test_graph[url].get_page()
+    except:
+        logger.debug('Failed to find a page in a test graph')
+        page = ''
+    return real_url, page
 
-                if findings == {}:
-                    # nothing to add to dbs
-                    #print(self.threadID+' had a parsing error')
-                    pass
-                else:
-                    new_urls = findings['url']
-                    emails = findings['email']
-                    self.store_sets['emails'].acquire()
-                    for e in emails:
-                        self.store_sets['emails'].add(e)
-                    self.store_sets['emails'].release() 
-                    
-                    # filter out visited urls
-                    #!!! LOCK !!!
-                    #new_urls = urlDB.notIn(new_urls)
-                    # add new urls to download queue
-                    self.dq.acquire()
-                    droped_count = 0
-                    for url in new_urls:
-                        if url not in self.store_sets['urls'].set:
-                            try:  
-                                self.dq.put(url, block=False)
-                                print('added url')
-                            except queue.Full:
-                                droped_count +=1
-                    if droped_count > 0:
-                        print('The download queue is full. Droped '+str(droped_count)+' of '+str(len(new_urls))+' new urls')
 
-                    self.dq.release()
 
-            # processing queue is empty. Lets wait and see if it fills up
-            else:
-                self.pq.release()
-                print('p is waiting')
-                time.sleep(1)
-                print('p is waiting 2')
+# --------------------------------------------------------------------------
+# Workers section
+# --------------------------------------------------------------------------
 
-        print("Exiting " + str(self.threadID))
+def watch_dog(t_id, exitFlag, loggerQueue, taskQueueSize, emailDict, urlDict, max_emails_harvested=None, max_urls_visited=None):
+    """the watchdog should send an exit signal when it detects no progress or an algorithm meats a finish criteria
+    also it is used to monitor and track overall algorithm progress """
 
-class Analizer(threading.Thread):
-    def __init__(self, threadID, shared_queues, shared_sets):
-        threading.Thread.__init__(self)
-        self.threadID = threadID
-        self.shared_sets = shared_sets
-        self.shared_queues = shared_queues
+    hang_count = 0
+    email_cnt = 0
+    url_cnt = 0
+    job_cnt = 0
+    start_t = time.time()
+    logger = get_queue_logger(loggerQueue)
+    while exitFlag.value == 0:
 
-    def run(self):
-        print("Starting " + str(self.threadID))
-        while not exitFlag:
-            #print('counting')
-            info = {'q':{}, 's':{}}
-            for qname in self.shared_queues:
-                q=self.shared_queues[qname]
-                q.acquire()
-                cnt = q.cnt()
-                info['q'][qname] = cnt
-                q.release()
-            for sname in self.shared_sets:
-                s=self.shared_sets[sname]
-                s.acquire()
-                cnt = s.len()
-                s.release()
-                info['s'][sname] = cnt
+        p_email_cnt = email_cnt
+        email_cnt = len(emailDict)
+
+        p_url_cnt = url_cnt
+        url_cnt = len(urlDict)
+
+        p_job_cnt = job_cnt
+        job_cnt = taskQueueSize.value
+
+        if (url_cnt == p_url_cnt) and (email_cnt == p_email_cnt) and (job_cnt == p_job_cnt):
+            hang_count += 1
+        processing_t = time.time()-start_t
+        visited_cnt = url_cnt-taskQueueSize.value
+        logger.info('Stats: harvested urls: {}, harvested emails: {}, visited urls {}, tasks left in queue: {}, processing time {:5.1f} seconds, avg speed {:3.2f} urls/sec'.format(
+            url_cnt, email_cnt, visited_cnt, taskQueueSize.value, processing_t, (visited_cnt)/processing_t))
+
+        max_emails_creteria = (max_emails_harvested != None) and (
+            max_emails_harvested < email_cnt)
+        max_urls_creteria = (max_urls_visited != None) and (
+            max_urls_visited < url_cnt)
+
+        if max_emails_creteria:
+            exitFlag.value = 1
+            logger.info('Finish criteria reached [max emails]. Exiting...')
+            break
+
+        if max_urls_creteria:
+            exitFlag.value = 1
+            logger.info('Finish criteria reached [max urls]. Exiting...')
+            break
+
+        if hang_count > 5:
+            exitFlag.value = 1
+            logger.info('Looks like the algorithm has hanged. Exiting...')
+            break
+
+        time.sleep(5)
+    return True
+
+def email_storer(p_id, exitFlag, loggerQueue, emailStoreQueue, emailDict):
+    """Used to store scrapped items in this case emails"""
+    logger = get_queue_logger(loggerQueue)
+    logger.debug('p_id: '+p_id+' started')
+
+    while exitFlag.value == 0:
+        sleep_duration = 0
+        try:
+            new_emails = set(emailStoreQueue.get(timeout=3))
+        except queue.Empty:
+            # wait when nothing to process
+            sleep_duration = 2
+        else:
             
-            print('Analizer: Elements count = '+str(info))
-            time.sleep(10)
+            # find emails that has to be stored
+            previously_found_emails = set(emailDict.keys())
+            emailsToStore = set(new_emails) - set(previously_found_emails)
+
+            new_email_dict = {}
+            for e in emailsToStore:
+                new_email_dict[e] = 1
+            emailDict.update(new_email_dict)
+            # save on disk as well
+            append_to_file('emails.out', emailsToStore)
+
+        time.sleep(sleep_duration)
+
+    logger.debug('p_id: '+p_id+' has finished')
+    return True
+
+
+def job_enqueuer(p_id, exitFlag, loggerQueue, urlResultQueue, jobQueue, jobQueueSize, urlDict, max_urls_visited = None):
+    """Used to enque new jobs based of new enqueued urls returned by processors"""
+    logger = get_queue_logger(loggerQueue)
+    logger.debug('p_id: '+p_id+' started')
+    url_count = 0
+
+    while exitFlag.value == 0:
+        sleep_duration = 0
+        try:
+            new_urls = set(urlResultQueue.get(timeout=3))
+        except queue.Empty:
+            # wait when nothing to process
+            sleep_duration = 2
+        else:
+
+            # find urls that has to be queued
+            previously_queued_urls = set(urlDict.keys())
+            urlsToQueue = set(new_urls) - set(previously_queued_urls)
+
+            actual_urls_queued = {}
+            for u in urlsToQueue:
+                try:
+                    if (max_urls_visited==None) or (max_urls_visited<url_count):
+                        jobQueue.put_nowait(u)
+                        actual_urls_queued[u] = 1
+                        with jobQueueSize.get_lock():
+                            jobQueueSize.value += 1
+                        url_count+=1
+
+                except queue.Full:
+                    break
+
+            # update the queued url dict/set
+            urlDict.update(actual_urls_queued)
+            # save urls on disk as well
+            append_to_file('urls.out', actual_urls_queued)
+
+        time.sleep(sleep_duration)
+
+    logger.debug('p_id: '+p_id+' has finished')
+    return True
+
+def page_downloader_and_parser(p_id, exitFlag, loggerQueue, test_graph, jobQueue, jobQueueSize, urlResultQueue, emailStoreQueue, urlDict, emailDict, locality):
+    """Used to process urls from a jobQueue - download pages, parse them and filter the results"""
+    logger = get_queue_logger(loggerQueue)
+    logger.debug('p_id: '+p_id+' started')
+    process_exitFlag = False
+    fail_cnt = 0
+
+    while exitFlag.value == 0 and process_exitFlag == False:
+
+        sleep_duration = 0
+
+        try:
+            url = jobQueue.get_nowait()
+            fail_cnt = 0
+            with jobQueueSize.get_lock():
+                jobQueueSize.value -= 1
+        except queue.Empty:
+            # wait when nothing to process
+            fail_cnt += 1
+            sleep_duration = 2
+        else:
+
+            # update processed url set
+            urlDict[url] = 1
+
+            # download page    
+            try:
+                [base_url, page] = download_html_page(logger, url) if (test_graph == {}) else download_html_page_simulated(logger, test_graph, url)
+                if page == '':
+                    # bad try. Continue to the next
+                    logger.warning('Failed to get a page from a source: '+str(url))
+                    continue
+            except:
+                # fetch error. Continue to the next
+                logger.warning('Failed to get a page from a source: '+str(url))
+                continue
+
+            # extract data
+            new_urls = extract_urls(page, base_url, locality)
+            new_emails = extract_emails(page)
+
+            # push urls further to queue new jobs
+            try:
+                urlResultQueue.put_nowait(new_urls)
+            except queue.Full:
+                logger.warning('Extracted url queue is full')
+                break
+            
+            # push emails further for storage
+            try:
+                emailStoreQueue.put_nowait(new_emails)
+            except queue.Full:
+                logger.warning('Extracted email queue is full')
+                break
+
+            # small report
+            logger.debug('p_id {} found {} email and {} urls'.format(p_id, len(new_emails), len(new_urls)))
+
+        # 5 misses in a row will cause worker to return
+        if fail_cnt > 5:
+            process_exitFlag = True
+
+        time.sleep(sleep_duration)
+
+    logger.debug('p_id: '+p_id+' has finished')
+    return True
+
+# --------------------------------------------------------------------------
+# Scrapper class
+# --------------------------------------------------------------------------
 
 class Scrapper():
-    def __init__(self, parser, test_graph={}):
-        self.max_downloaders = 1
-        self.max_processors = 1
+    def __init__(self, loggerQueue, processes_number=2, test_graph={}, locality='any', max_urls = None):
+        self.processes_number = processes_number
         self.urls = []
-        self.downloaders = []
-        self.processors = []
-        self.parser = parser
+        self.start_time = ''
+        self.processes = []
         self.test_graph = test_graph
+        self.locality = locality
+        self.max_urls = max_urls
+        self.exitFlag = Value("i", 0)
         # define queues
-        self.downloadQueue   = sharedQueue(size = 1000)
-        self.processingQueue = sharedQueue(size = 10)     
-        self.analyzer = None
-        # define sets
-        self.urls_set = sharedSet()
-        self.emails_set = sharedSet()
+        self.loggerQueue = loggerQueue
+        self.taskQueue = Queue()
+        self.taskQueueSize = Value("i", 0)
+        self.urlResultQueue = Queue()
+        self.emailStoreQueue = Queue()
+        # define shared dicts (acting like sets really)
+        self.manager = Manager()
+        self.collected_urls_dict = self.manager.dict()
+        self.collected_emails_dict = self.manager.dict()
 
     def set_urls(self, urls):
         self.urls = urls
 
     def start(self):
-        print('start scrapping')
-        print('filling the download queue with starting urls')
-
-        self.downloadQueue.acquire()
+        self.start_time = time.time()
+        logger = get_queue_logger(self.loggerQueue)
+        logger.info('Starting scrapping')
+        logger.info('Filling the download queue with initial urls')
         for u in self.urls:
-            self.downloadQueue.put(u)
-            #print(u)
-        self.downloadQueue.release()
+            self.taskQueue.put(u)
+            append_to_file('urls.out', [u])
+            with self.taskQueueSize.get_lock():
+                self.taskQueueSize.value += 1
 
         # start all threads
-        self.analyzer = Analizer('thread_dwn_anl_0', {'down_q': self.downloadQueue, 'proc_q': self.processingQueue}, {'url_s': self.urls_set, 'email_s': self.emails_set})
-        self.analyzer.start()
+        # first the watch dog
+        p = Process(target=watch_dog, args=(
+            'watch_dog_0', self.exitFlag, self.loggerQueue, self.taskQueueSize, self.collected_emails_dict, self.collected_urls_dict, self.max_urls, None))
+        self.processes.append(p)
+        p.start()
 
-        for i in range(self.max_downloaders):
-            thread_id = 'thread_dwn_'+str(i)
-            thread = downloaderThread(thread_id, self.downloadQueue, self.processingQueue, self.urls_set, self.test_graph)
-            thread.start()
-            self.downloaders.append(thread)
+        # second the enquer
+        p = Process(target=job_enqueuer, args=(
+            'job_enqueuer_0', self.exitFlag, self.loggerQueue, self.urlResultQueue, self.taskQueue, self.taskQueueSize, self.collected_urls_dict))
 
-        for i in range(self.max_processors):
-            thread_id = 'thread_proc_'+str(i)
-            thread = processorThread(thread_id, self.downloadQueue, self.processingQueue, self.parser, {'urls':self.urls_set, 'emails':self.emails_set})
-            thread.start()
-            self.processors.append(thread)
+        self.processes.append(p)
+        p.start()
 
-        while not exitFlag:
-            time.sleep(10)
+        # third the email storer
+        p = Process(target=email_storer, args=(
+        'email_storer_0', self.exitFlag, self.loggerQueue, self.emailStoreQueue, self.collected_emails_dict))
+
+        self.processes.append(p)
+        p.start()
+
+        # then the downloaders
+        for i in range(self.processes_number):
+            p_id = 'process_'+str(i)
+            p = Process(target=page_downloader_and_parser , args=(
+                p_id, self.exitFlag, self.loggerQueue, self.test_graph, self.taskQueue, self.taskQueueSize, self.urlResultQueue, self.emailStoreQueue, self.collected_urls_dict, self.collected_emails_dict, self.locality))
+            self.processes.append(p)
+            p.start()
+
+        while self.exitFlag.value == 0:
+            logger.debug('Main process is waiting')
+            time.sleep(5)
+
+        logger.debug('Joining the processes...')
+        for p in self.processes:
+            p.join()
+
+        logger.info("The scrapping is finished")
+        logger.info("The scrapping took %s seconds" %(time.time() - self.start_time))
+        return True
+
+# --------------------------------------------------------------------------
+# Test section
+# --------------------------------------------------------------------------
+
+class TestWholeScrapper(unittest.TestCase):
+
+    def test_traversan_on_test_graph(self):
+
+        log_queue = Queue(-1)
+        listener = createQueueListener(log_queue)    
+        listener.start()
+        test_graph, test_urls, test_emails = generate_test_graph(sameDomain = False)
+        initial_urls = [test_graph[list(test_graph)[0]].url]
+
+        s = Scrapper(log_queue, processes_number=4, locality='any', test_graph=test_graph, max_urls = 120 )
+        s.set_urls(initial_urls)
+        s.start()
+
+        # read resulting urls and emails
+        found_urls = read_initial_urls('urls.out')
+        found_emails = read_initial_urls('emails.out')
         
-        for t in self.processors:
-            t.join()
-        for t in self.downloaders:
-            t.join()
-        
-        self.analyzer.join()
+        # remove new lines
+        found_urls = [u[:-1] for u in found_urls]
+        found_emails = [e[:-1] for e in found_emails]
+        print('found urls:'+str(len(found_urls))+' of them unique: '+str(len(set(found_urls))))
+        print('generated '+str(len(test_urls))+' test urls'+' of them unique: '+str(len(set(test_urls))))
+        print('found emails:'+str(len(found_emails))+' of them unique: '+str(len(set(found_emails))))
+        print('generated '+str(len(test_emails))+' test emails'+' of them unique: '+str(len(set(test_emails))))
+        # lets check not found urls
+        not_found_urls = set(test_urls)-set(found_urls)
+        not_found_emails = set(test_emails)-set(found_emails)
 
-class Parser():
-    # this class is used to parse html content
-    def __init__(self):
-        self.targets = {}
-    def parse(self, content):
-        # used to parse content
-        findings = {}
-        if (type(content) != type('')) or len(content)<1:
-            return findings
-        for t in self.targets:
-            try:
-                findings[t] = re.findall(self.targets[t], content)
-            except:
-                print(type(self.targets[t]))
-                print(type(content))
-        return findings
-    def add_target(self, name, regexp):
-        # used to add new scrapping targets
-        self.targets[name] = regexp
+        if len(not_found_urls)+len(not_found_emails) == 0:
+            print('Test run completed successfully')
+        else:
+            print('Some urls or emails were not found. Test run failed')
 
-class sharedQueue():
-    # this class unifies lock and queue in one instance
-    def __init__(self, size):
-        self.q = queue.Queue(size)
-        self.Lock = threading.Lock()
-        self.count = 0
-        self.max = size
-    def get(self):
-        el = self.q.get()
-        self.count-=1
-        return el
-    def cnt(self):
-        return self.count
-    def empty(self):
-        return self.q.empty()
-    def put(self, el, block=True):
-        self.q.put(el, block=block)
-        self.count+=1
-    def acquire(self):
-        print(str(self)+' queue is being aquired')
-        self.Lock.acquire()
-        print(str(self)+' queue is aquired')
-    def release(self):
-        print(str(self)+' queue is being released')
-        self.Lock.release()
-        print(str(self)+' queue is released')
-
-class sharedSet():
-    # this class unifies lock and set in one instance
-    def __init__(self):
-        self.set = set()
-        self.Lock = threading.Lock()
-    def add(self, el):
-        self.set.add(el)
-    def acquire(self):
-        self.Lock.acquire()
-    def release(self):
-        self.Lock.release()
-    def len(self):
-        return len(self.set)
+        self.assertEqual(len(not_found_urls), 0)
+        self.assertEqual(len(not_found_emails), 0)
 
 
 
-if __name__ == "__main__":
+# --------------------------------------------------------------------------
+# Main
+# --------------------------------------------------------------------------
+
+if __name__ == '__main__':
+
     # collect options
     parser = argparse.ArgumentParser()
-    parser.add_argument("-u", "--url_list", type=str, default='urls',   help="A file of new line separated list of urls to start scrapping from")
-    parser.add_argument("-d", "--depth",    type=int, default=50,       help="Max depth of url following")
-    parser.add_argument("-m", "--max",      type=int, default=10000,    help="Max number of urls scrapped")
-    parser.add_argument("-t", "--test",  action="store_true",           help="run test on offline artifitial graph")
-    parser.add_argument("-D", "--domainonly",   action="store_true",    help="Restrict scrapping to initial domain only")
+    parser.add_argument("-u", "--url_list", type=str, default='urls',
+                        help="A file of new line separated list of urls to start scrapping from")
+    parser.add_argument("-d", "--depth",    type=int,
+                        default=5,       help="Max depth of url following [not implemented in current version]")
+    parser.add_argument("-m", "--max",      type=int,
+                        default=None,    help="Max number of urls scrapped")
+    parser.add_argument("-t", "--test",  action="store_true",
+                        help="run test on offline artifitial graph")
+    parser.add_argument("-w", "--workers",    type=int,
+                        default=4,       help="number of scrapper workers to spawn. Improves scrapping speed")
+    parser.add_argument("-D", "--domainonly",   action="store_true",
+                        help="Restrict scrapping to initial domain only")
+    parser.add_argument("-S", "--subdomainonly",   action="store_true",
+                        help="Restrict scrapping to initial subdomain only. Most narrow way of scrapping")
     args = parser.parse_args()
 
+    # remove old files
+    clean_log_files(['urls.out', 'emails.out', 'scrapper.log'])
+
+    # Configure loggers
+    # configure queue logger listener part 
+    log_queue = Queue(-1)
+    listener = createQueueListener(log_queue)    
+    listener.start()
+
     # get initial urls
-    urls = initial_urls(args.url_list)
-    # prepare parser
-    url_and_email_parser = Parser()
-    urlregex = 'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+'
-    emailregex = '([a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+)'
-    
-
-    url_and_email_parser.add_target('url', urlregex)
-    url_and_email_parser.add_target('email', emailregex)
-    
+    initial_urls = read_initial_urls(args.url_list)
     test_graph = {}
-
-    exitFlag = 0
-    if args.test or True:
-        test_graph, test_urls, test_emails = generate_test_graph()
-        s = Scrapper(url_and_email_parser, test_graph)
-        first_test_url = test_graph[list(test_graph)[0]].url 
-        s.set_urls([first_test_url])
-    else:
-        s = Scrapper(url_and_email_parser)
-        s.set_urls(urls)
     
-    # start the scrapper
+    if args.subdomainonly:
+        locality = 'subdomainonly'
+    elif args.domainonly:
+        locality = 'domainonly'
+    else: 
+        locality = 'any'
+
+    if args.test:
+        unittest.main()
+
+    # initiate and start the scrapper    
+    s = Scrapper(log_queue, processes_number=args.workers, locality=locality, test_graph=test_graph, max_urls = args.max )
+    s.set_urls(initial_urls)
     s.start()
+
+    # stop the logger queue listener after the scrapper stops
+    listener.stop()
