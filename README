@@ -1,0 +1,84 @@
+
+# Practice Scrapper documentation
+## Installation
+    - virtualenv venv 
+    - venv activate
+    - pip install -r requirements
+## Usage
+    - read the usage help page
+        python app.py -h 
+    - run with default settings
+        python app.py OR python app.py 
+    - run modest testing
+        python app.py -t
+
+## Folder organization
+output files:
+    - emails.out - list of session scrapped emails
+    - urls.out - list of session scraped urls
+    - scrapper.log - a log file
+input files:
+    - urls - expected name of file that contains initial urls for scrapper separated by newlines
+code files:
+    - testlib.py    - a file containing high level testing functionality means - generation of simulated dpocument network graph for testing
+    - parsers.py    - a file containing parsing and extraction functionality used by the main algorithm to extract data from downloaded pages
+    - app.py        - a file containing the main algorithm functionality  
+
+## Software design outline
+### Data pipeline and worker processes
+The scrapper is built whith a processing pipeline in mind. The algorithm is multiprocess based and organized in the next manner:
+    - Scrapper object start() method initiates the next processes:
+        - N [download_and_process] workers download enqued urls and extracts new data (urls, emails). It pushes data to the next processing queue    
+            - [job_enquer] reads scrapped URLs from the processed queue, finds novel (not visited and not enqueued for visit) URLs and enqueues them to job queue to be processed later
+            - [email_storer] reads scrapped emails from the processed queues, finds novel ones and saves them to disk
+            - [watch_dog/analyzer] reads the state of queues, producess stats output, watches for algorithm hangs
+                - [log_queue_listener] part of python logging functionality. Reads the new logs sent by loggeres in different processes of the program and sends them to file and console handlers
+
+Simplified pseudo-algorithm:
+-> initiate/clean dbs
+-> add initial urls to job q ->
+    -> (*) [job queue]
+        -> download
+        -> extract
+        -> add to prosecced queue
+            -> [processed queue] 
+                -> add to job queue (go to *) 
+                -> add to enqueued url DB 
+                -> add to collected e-mail DB 
+
+### Multiprocessing queues and shared resourses
+The algorithm uses many shared datastructures and task queues to synchronize a multiprocessing operation.
+Used multiprocessing queues and resourses (are part of Scrapper object):
+        self.exitFlag           - a multiprocessing shared value to synchronize workers end of work in polling manner
+        self.loggerQueue        - a multiprocessing shared queue used by queue logger in different processes as sources and a single queue log listener as a sink 
+        self.taskQueue          - a multiprocessing shared queue used to enque next download_and_prcess jobs. job_enqueuer is a source, download_and_process is a sink
+        self.taskQueueSize      - a multiprocessing shared value reflecting the occupation of taskQueue. Used for stats mostly 
+        self.urlResultQueue     - a multiprocessing shared queue to send new discovered urls to. download_and_process is a source job_enqueuer is a sink
+        self.emailStoreQueue    - a multiprocessing shared queue to send new discovered emails to. download_and_process is a source email_storer is a sink
+        self.collected_urls_dict    - shared dictionary that is mainly used as a set reflecting already discovered and enqueued urls. We need it to check new urls against to add a novel urls only to a job queue. It also mirrores a file urls.out
+        self.collected_emails_dict  - shared dictionary that is mainly used as a set reflecting already discovered emails. We need it to check new emails against to store new emails only. It also mirrores a file emails.out
+
+### Design considerations
+    - scrapping all the intenet seems impractical thats why one should consider next scrapping stratagies:
+        -- scrapping is a FIFO job queue. This ensures DFS traversal [implemented]
+        -- scrap to max 'depth' of the network graph [not implemented]
+        -- scrap up to finite number of urls [implemented]
+        -- scrap up to finite number of collected emails [implemented]
+        -- scrap within domain locality only. This means we only scrap urls that have the same domain as a url they were scrraped from. This is also quite logical approach as it bounds us to scrapping organizationa email networks instead of all the internet
+        -- scrap within subdomain locality only. Quite like the previous approach only narrower. 
+        -- other custom URL lead strategies [not implemented]
+    - results and shared data structures:
+        -- the algorithm uses in memory shred data structures and it is implemented this way for convenience but for better scalability and bigger and wider scrapping runs fask nosql DBs can be used instead 
+    - usage of multiprocess architecture:
+        -- the multiprocessing architecture was chosen to provide algorithm band effectiveness and overall speed requirement 
+
+### Testing
+Integral testing is implemented using functionality that generates a test graph of in memory randomized pages interconnected to simulate internet document network
+In test mode the generated graph is used by scrapper for navigation and test data collection. In the end of the process colected data is compared to generated one 
+
+## Further work
+Due to time limitations and specific development focus the product was built in not very modular and generalized manner. Proper scrpper should be organizded in
+more frameworky/modular way. Jobs should propogate through standirdized modules families of downloaders/data extractors/data storers/job enquers which 
+should be connected with scalable, standardized interprocess data sharing machinery (queues, pipes). In the current version the separation
+of procedure types exists of course but in not enaugh modular form   
+
