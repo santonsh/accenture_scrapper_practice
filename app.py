@@ -42,7 +42,7 @@ def get_queue_logger(loggerQueue):
         queue_handler = QueueHandler(loggerQueue)
         logger = logging.getLogger()
         logger.addHandler(queue_handler)
-        logger.setLevel(logging.DEBUG)
+        logger.setLevel(logging.INFO)
         return logger
 
 def append_to_file(fname, content):
