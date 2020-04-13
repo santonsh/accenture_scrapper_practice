@@ -13,13 +13,14 @@
         python app.py OR python app.py 
     - run modest testing
         python app.py -t
-    - Advanced example: run with 8 workers, maximum 100 urls, traverce the same domain only, start with urls listed in urls.in
-        python app.py -m 100 -w 8 -l domainonly -u urls.in
+    - Advanced example: run with 8 workers, scrap/visit maximum 100 urls, traverce the same domain only, start with urls listed in urls.in
+        python app.py -v 100 -w 8 -l domainonly -u urls.in
 
 ## Folder organization
 output files:
-    - emails.out - list of session scrapped emails
-    - urls.out - list of session scraped urls
+    - emails.collected - list of session scrapped emails
+    - urls.collected - list of session scraped urls
+    - urls.visited - list of urls visited/scrapped
     - scrapper.log - a log file
 input files:
     - urls - expected name of file that contains initial urls for scrapper separated by newlines
@@ -33,20 +34,20 @@ code files:
 The scrapper is built whith a processing pipeline in mind. The algorithm is multiprocess based and organized in the next manner:
     - Scrapper object start() method initiates the next processes:
         - N [download_and_process] workers download enqued urls and extracts new data (urls, emails). It pushes data to the next processing queue    
-            - [job_enquer] reads scrapped URLs from the processed queue, finds novel (not visited and not enqueued for visit) URLs and enqueues them to job queue to be processed later
-            - [email_storer] reads scrapped emails from the processed queues, finds novel ones and saves them to disk
+            - [url_handler] reads scrapped URLs from the processed queue, finds novel (not visited and not enqueued for visit) URLs and enqueues them to task queue to be processed later, add them to the disk
+            - [email_handler] reads scrapped emails from the processed queues, finds novel ones and saves them to disk
             - [watch_dog/analyzer] reads the state of queues, producess stats output, watches for algorithm hangs
                 - [log_queue_listener] part of python logging functionality. Reads the new logs sent by loggeres in different processes of the program and sends them to file and console handlers
 
 Simplified pseudo-algorithm:
 -> initiate/clean dbs
 -> add initial urls to job q ->
-    -> (*) [job queue]
+    -> (*) [task queue]
         -> download
         -> extract
         -> add to prosecced queue
             -> [processed queue] 
-                -> add to job queue (go to *) 
+                -> add to task queue (go to *) 
                 -> add to enqueued url DB 
                 -> add to collected e-mail DB 
 
@@ -86,3 +87,10 @@ more frameworky/modular way. Jobs should propogate through standirdized modules 
 should be connected with scalable, standardized interprocess data sharing machinery (queues, pipes). In the current version the separation
 of procedure types exists of course but in not enaugh modular form   
 
+
+
+
+### urgent to do:
+    - fix readme to markup language
+    - fix the test option
+    - ?
